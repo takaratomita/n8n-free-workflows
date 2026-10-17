@@ -1,0 +1,116 @@
+import { dirname } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { codeFrom, sticky, configNode, codeNode, ifNode, emailNode, connect } from '../../scripts/lib/n8n.mjs';
+
+const code = codeFrom(dirname(fileURLToPath(import.meta.url)));
+
+export default {
+  name: 'Hacker News keyword digest (email, no duplicates)',
+  nodes: [
+    sticky(
+      'hn-note-about',
+      'About this workflow',
+      [
+        '## Hacker News keyword digest',
+        'Searches Hacker News (free Algolia API, no key needed) for your keywords and emails you **only stories you have not seen yet**.',
+        '',
+        '### How it works',
+        '1. **Schedule** runs once a day (or use **Manual Trigger** to test).',
+        '2. **Build Queries** makes one search per keyword for the last `lookbackHours`.',
+        '3. **Search HN** calls `hn.algolia.com` once per keyword.',
+        '4. **Pick New Stories** merges results, drops stories below `minPoints` or already emailed, and writes the digest.',
+        '5. **Send Digest** emails it; **Save Seen** then remembers what was sent.',
+        '',
+        '### Setup',
+        '- Edit only the **Config** node.',
+        '- Open **Send Digest** and select your SMTP credential.',
+        '- Activate the workflow. The "already sent" list is kept in workflow static data, which n8n saves only for active (production) runs — manual test runs will repeat stories.',
+      ].join('\n'),
+      [-420, -420],
+      { width: 520, height: 560 },
+    ),
+    sticky(
+      'hn-note-config',
+      'Config note',
+      [
+        '## Config',
+        '- `keywords`: comma or newline separated (max 20)',
+        '- `lookbackHours`: search window (1–168)',
+        '- `minPoints`: skip stories with fewer points',
+        '- `maxPerKeyword`: results per keyword (1–100)',
+        '- `alertTo` / `fromEmail`: email addresses',
+      ].join('\n'),
+      [140, -300],
+      { width: 380, height: 240, color: 4 },
+    ),
+    {
+      parameters: { rule: { interval: [{ field: 'days', daysInterval: 1, triggerAtHour: 8 }] } },
+      id: 'hn-schedule',
+      name: 'Schedule Trigger',
+      type: 'n8n-nodes-base.scheduleTrigger',
+      typeVersion: 1.2,
+      position: [0, 0],
+    },
+    {
+      parameters: {},
+      id: 'hn-manual',
+      name: 'Manual Trigger',
+      type: 'n8n-nodes-base.manualTrigger',
+      typeVersion: 1,
+      position: [0, 180],
+    },
+    configNode('hn-config', [240, 80], {
+      keywords: 'n8n, self-hosted, open source automation',
+      lookbackHours: 24,
+      minPoints: 5,
+      maxPerKeyword: 20,
+      alertTo: 'you@example.com',
+      fromEmail: 'n8n@example.com',
+    }),
+    codeNode('hn-build', 'Build Queries', code('build-queries.js'), [460, 80]),
+    {
+      parameters: {
+        url: 'https://hn.algolia.com/api/v1/search_by_date',
+        sendQuery: true,
+        queryParameters: {
+          parameters: [
+            { name: 'query', value: '={{ $json.keyword }}' },
+            { name: 'tags', value: 'story' },
+            { name: 'numericFilters', value: '=created_at_i>{{ $json.since }}' },
+            { name: 'hitsPerPage', value: '={{ $json.hitsPerPage }}' },
+          ],
+        },
+        options: { timeout: 20000 },
+      },
+      id: 'hn-search',
+      name: 'Search HN',
+      type: 'n8n-nodes-base.httpRequest',
+      typeVersion: 4.2,
+      position: [680, 80],
+      retryOnFail: true,
+      maxTries: 3,
+      waitBetweenTries: 2000,
+      onError: 'continueRegularOutput',
+    },
+    codeNode('hn-pick', 'Pick New Stories', code('pick-new-stories.js'), [900, 80]),
+    ifNode('hn-if', 'Any New Stories?', '={{ $json.hasNew }}', [1120, 80]),
+    emailNode(
+      'hn-email',
+      'Send Digest',
+      { to: '={{ $json.to }}', subject: '={{ $json.subject }}', text: '={{ $json.text }}' },
+      [1340, 0],
+    ),
+    codeNode('hn-save', 'Save Seen', code('save-seen.js'), [1560, 0]),
+  ],
+  connections: connect([
+    ['Schedule Trigger', 'Config'],
+    ['Manual Trigger', 'Config'],
+    ['Config', 'Build Queries'],
+    ['Build Queries', 'Search HN'],
+    ['Search HN', 'Pick New Stories'],
+    ['Pick New Stories', 'Any New Stories?'],
+    ['Any New Stories?', 'Send Digest', 0],
+    ['Send Digest', 'Save Seen'],
+  ]),
+  settings: { executionOrder: 'v1' },
+};

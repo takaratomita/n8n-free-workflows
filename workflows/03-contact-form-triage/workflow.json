@@ -1,0 +1,430 @@
+{
+  "name": "Contact form webhook with spam scoring and team email",
+  "nodes": [
+    {
+      "parameters": {
+        "content": "## Contact form triage\nA webhook endpoint for your website contact form. It validates the fields, scores the message for spam, emails real messages to your team and answers the form with JSON.\n\n### Request\n`POST /webhook/contact-form` with JSON or form fields: `name`, `email`, `message`, optional `company`, and a hidden honeypot field `hp_url` that humans leave empty.\n\n### Routing\n- invalid → **400** with the list of errors\n- spam (score ≥ `spamThreshold`) → **200** without any email (do not tell spammers)\n- ok → **Notify Team** (Reply-To = sender) → optional auto-reply → **200** with a ticket ID\n\n### Setup\n- Edit only the **Config** node; select your SMTP credential in both email nodes.\n- Auto-reply is **off** by default: anyone can make your server email any address through a public form. Turn it on only with rate limiting or a CAPTCHA in front.",
+        "width": 560,
+        "height": 600
+      },
+      "id": "cf-note-about",
+      "name": "About this workflow",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        -460,
+        -480
+      ]
+    },
+    {
+      "parameters": {
+        "content": "## Spam score\n- honeypot `hp_url` filled: +10\n- email domain in `blockedDomains`: +5\n- more than `maxLinks` links: +5\n- each word from `blockedWords`: +2\n- mostly UPPER CASE: +1",
+        "width": 360,
+        "height": 240,
+        "color": 4
+      },
+      "id": "cf-note-scoring",
+      "name": "Scoring note",
+      "type": "n8n-nodes-base.stickyNote",
+      "typeVersion": 1,
+      "position": [
+        380,
+        -320
+      ]
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "contact-form",
+        "responseMode": "responseNode",
+        "options": {}
+      },
+      "id": "cf-webhook",
+      "name": "Webhook",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2.1,
+      "position": [
+        0,
+        80
+      ],
+      "webhookId": "0c8f2b9e-4d61-4f0a-9b57-3e2a6c1d8f43"
+    },
+    {
+      "parameters": {
+        "assignments": {
+          "assignments": [
+            {
+              "id": "cf-config-00",
+              "name": "siteName",
+              "value": "Your Site",
+              "type": "string"
+            },
+            {
+              "id": "cf-config-01",
+              "name": "teamEmail",
+              "value": "team@example.com",
+              "type": "string"
+            },
+            {
+              "id": "cf-config-02",
+              "name": "fromEmail",
+              "value": "forms@example.com",
+              "type": "string"
+            },
+            {
+              "id": "cf-config-03",
+              "name": "spamThreshold",
+              "value": 5,
+              "type": "number"
+            },
+            {
+              "id": "cf-config-04",
+              "name": "maxLinks",
+              "value": 2,
+              "type": "number"
+            },
+            {
+              "id": "cf-config-05",
+              "name": "blockedDomains",
+              "value": "mailinator.com, yopmail.com, guerrillamail.com, 10minutemail.com, tempmail.com",
+              "type": "string"
+            },
+            {
+              "id": "cf-config-06",
+              "name": "blockedWords",
+              "value": "casino, backlinks, seo services, crypto investment, loan offer",
+              "type": "string"
+            },
+            {
+              "id": "cf-config-07",
+              "name": "sendAutoReply",
+              "value": false,
+              "type": "boolean"
+            }
+          ]
+        },
+        "includeOtherFields": true,
+        "options": {}
+      },
+      "id": "cf-config",
+      "name": "Config",
+      "type": "n8n-nodes-base.set",
+      "typeVersion": 3.4,
+      "position": [
+        220,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate the form submission, score it for spam and prepare the team email.\n// Output status: \"invalid\" (400 to the form), \"spam\" (silently accepted, no email),\n// or \"ok\" (team is emailed). Scoring rules are in Config so you can tune them.\nconst cfg = $('Config').first().json;\nconst req = $('Webhook').first().json;\nconst body = req.body && typeof req.body === 'object' ? req.body : {};\n\nconst str = (v) => (typeof v === 'string' ? v : v === undefined || v === null ? '' : String(v));\n// Strip invisible/bidi formatting characters but keep ZWJ/ZWNJ (needed by emoji and some scripts).\nconst cp = (...c) => String.fromCodePoint(...c);\nconst INVISIBLE = new RegExp(`[${cp(0x200b, 0x200e, 0x200f, 0x2060, 0xfeff)}${cp(0x202a)}-${cp(0x202e)}${cp(0x2066)}-${cp(0x2069)}]`, 'gu');\nconst oneLine = (v, max) => {\n  const s = str(v).replace(INVISIBLE, '').replace(/[\\p{Cc}\\s]+/gu, ' ').trim();\n  return s.length > max ? `${s.slice(0, max - 1)}…` : s;\n};\nconst list = (v) => str(v).split(/[,\\n]/).map((s) => s.trim().toLowerCase()).filter(Boolean);\n\n// Honeypot: a hidden input named \"hp_url\". Not \"website\"/\"url\": browsers and password\n// managers autofill those, which would silently drop real messages.\nconst HONEYPOT_FIELD = 'hp_url';\n// Plain address only (no display names, quotes, angle brackets or lists): it becomes Reply-To.\nconst EMAIL_RE = /^[A-Za-z0-9.!#$%&'*+/=?^_`{|}~-]{1,64}@[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*\\.[A-Za-z]{2,24}$/;\n\nconst name = oneLine(body.name, 100);\nconst email = oneLine(body.email, 254).toLowerCase();\nconst company = oneLine(body.company, 100);\nconst rawMessage = str(body.message).replace(/\\r\\n?/g, '\\n').replace(INVISIBLE, '');\nconst message = rawMessage.replace(/[^\\P{Cc}\\n\\t]/gu, '').trim();\nconst honeypot = str(body[HONEYPOT_FIELD]).trim();\n\nconst errors = [];\nif (!name) errors.push('name is required');\nif (!EMAIL_RE.test(email)) errors.push('email is not a valid address');\nif (message.length < 10) errors.push('message must be at least 10 characters');\nif (message.length > 5000) errors.push('message must be at most 5000 characters');\n\nconst ticketId = Array.from({ length: 8 }, () => 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789'[Math.floor(Math.random() * 32)]).join('');\n\nif (errors.length) {\n  return [{ json: { status: 'invalid', errors, ticketId } }];\n}\n\nlet score = 0;\nconst reasons = [];\nif (honeypot) {\n  score += 10;\n  reasons.push(`honeypot field \"${HONEYPOT_FIELD}\" was filled (+10)`);\n}\nconst domain = email.split('@')[1] ?? '';\nif (list(cfg.blockedDomains).some((d) => domain === d || domain.endsWith(`.${d}`))) {\n  score += 5;\n  reasons.push(`disposable/blocked email domain ${domain} (+5)`);\n}\nconst haystack = `${name} ${company} ${message}`.toLowerCase();\nfor (const w of list(cfg.blockedWords)) {\n  if (haystack.includes(w)) {\n    score += 2;\n    reasons.push(`blocked word \"${w}\" (+2)`);\n  }\n}\nconst links = (message.match(/https?:\\/\\/|www\\./gi) || []).length;\nconst maxLinks = Number.isFinite(Number(cfg.maxLinks)) ? Number(cfg.maxLinks) : 2;\nif (links > maxLinks) {\n  score += 5;\n  reasons.push(`${links} links (more than ${maxLinks}) (+5)`);\n}\nconst letters = message.replace(/[^A-Za-z]/g, '');\nif (letters.length >= 20 && letters.replace(/[^A-Z]/g, '').length / letters.length > 0.7) {\n  score += 1;\n  reasons.push('mostly upper case (+1)');\n}\n\nconst threshold = Number(cfg.spamThreshold) > 0 ? Number(cfg.spamThreshold) : 5;\nconst status = score >= threshold ? 'spam' : 'ok';\nconst site = oneLine(cfg.siteName, 60) || 'your site';\n\nconst text = [\n  `New message from the ${site} contact form (ticket ${ticketId}).`,\n  '',\n  `Name:    ${name}`,\n  `Email:   ${email}`,\n  ...(company ? [`Company: ${company}`] : []),\n  `Spam score: ${score} (threshold ${threshold})${reasons.length ? ` — ${reasons.join('; ')}` : ''}`,\n  '',\n  '--- message ---',\n  message,\n  '---------------',\n  '',\n  'Reply to this email to answer the sender directly.',\n].join('\\n');\n\nreturn [\n  {\n    json: {\n      status,\n      score,\n      reasons,\n      ticketId,\n      name,\n      email,\n      replyTo: email,\n      to: cfg.teamEmail,\n      subject: `[${site}] Contact form: ${name} (${ticketId})`,\n      text,\n      autoReplySubject: `We received your message (${ticketId})`,\n      autoReplyText: [\n        `Hi ${name},`,\n        '',\n        `Thanks for contacting ${site}. We received your message and will get back to you soon.`,\n        `Your reference: ${ticketId}`,\n        '',\n        'This is an automatic reply.',\n      ].join('\\n'),\n    },\n  },\n];\n"
+      },
+      "id": "cf-validate",
+      "name": "Validate & Score",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        440,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cf-if-valid-c0",
+              "leftValue": "={{ $json.status !== 'invalid' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "cf-if-valid",
+      "name": "Valid?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        660,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cf-if-spam-c0",
+              "leftValue": "={{ $json.status === 'spam' }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "cf-if-spam",
+      "name": "Spam?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        880,
+        0
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $('Config').first().json.fromEmail }}",
+        "toEmail": "={{ $json.to }}",
+        "subject": "={{ $json.subject }}",
+        "emailFormat": "text",
+        "text": "={{ $json.text }}",
+        "options": {
+          "appendAttribution": false,
+          "replyTo": "={{ $json.replyTo }}"
+        }
+      },
+      "id": "cf-email-team",
+      "name": "Notify Team",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1100,
+        80
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": {
+            "caseSensitive": true,
+            "leftValue": "",
+            "typeValidation": "strict",
+            "version": 2
+          },
+          "conditions": [
+            {
+              "id": "cf-if-auto-c0",
+              "leftValue": "={{ $('Config').first().json.sendAutoReply === true }}",
+              "rightValue": "",
+              "operator": {
+                "type": "boolean",
+                "operation": "true",
+                "singleValue": true
+              }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "cf-if-auto",
+      "name": "Auto-reply On?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [
+        1320,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "fromEmail": "={{ $('Config').first().json.fromEmail }}",
+        "toEmail": "={{ $('Validate & Score').first().json.email }}",
+        "subject": "={{ $('Validate & Score').first().json.autoReplySubject }}",
+        "emailFormat": "text",
+        "text": "={{ $('Validate & Score').first().json.autoReplyText }}",
+        "options": {
+          "appendAttribution": false
+        }
+      },
+      "id": "cf-email-auto",
+      "name": "Send Auto-reply",
+      "type": "n8n-nodes-base.emailSend",
+      "typeVersion": 2.1,
+      "position": [
+        1540,
+        0
+      ],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 5000,
+      "onError": "continueRegularOutput"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: true, ticketId: $('Validate & Score').first().json.ticketId }) }}",
+        "options": {
+          "responseCode": 200
+        }
+      },
+      "id": "cf-respond-ok",
+      "name": "Respond OK",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        1760,
+        80
+      ]
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify({ ok: false, errors: $json.errors }) }}",
+        "options": {
+          "responseCode": 400
+        }
+      },
+      "id": "cf-respond-bad",
+      "name": "Respond 400",
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.5,
+      "position": [
+        880,
+        240
+      ]
+    }
+  ],
+  "connections": {
+    "Webhook": {
+      "main": [
+        [
+          {
+            "node": "Config",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Config": {
+      "main": [
+        [
+          {
+            "node": "Validate & Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate & Score": {
+      "main": [
+        [
+          {
+            "node": "Valid?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Valid?": {
+      "main": [
+        [
+          {
+            "node": "Spam?",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond 400",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Spam?": {
+      "main": [
+        [
+          {
+            "node": "Respond OK",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Notify Team",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Notify Team": {
+      "main": [
+        [
+          {
+            "node": "Auto-reply On?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Auto-reply On?": {
+      "main": [
+        [
+          {
+            "node": "Send Auto-reply",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Send Auto-reply": {
+      "main": [
+        [
+          {
+            "node": "Respond OK",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  }
+}
